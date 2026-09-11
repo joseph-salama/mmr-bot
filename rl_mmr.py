@@ -32,6 +32,15 @@ SEASON_PLAYLIST_URL = (
     "{platform}/{name}/segments/playlist"
 )
 
+# Official Tracker Network public API (requires TRN_API_KEY). Works much better from Railway.
+PUBLIC_API_URL = (
+    "https://public-api.tracker.gg/v2/rocket-league/standard/profile/{platform}/{name}"
+)
+PUBLIC_SEASON_PLAYLIST_URL = (
+    "https://public-api.tracker.gg/v2/rocket-league/standard/profile/"
+    "{platform}/{name}/segments/playlist"
+)
+
 # Current-season competitive playlist IDs used by Tracker Network / Psyonix.
 PLAYLIST_DOUBLES = 11  # Ranked Doubles 2v2
 PLAYLIST_STANDARD = 13  # Ranked Standard 3v3
@@ -130,6 +139,32 @@ def _trn_headers() -> dict[str, str]:
     return headers
 
 
+def _has_trn_api_key() -> bool:
+    return bool(os.getenv("TRN_API_KEY", "").strip())
+
+
+def _profile_urls(epic_name: str, platform: str) -> list[str]:
+    encoded = quote(epic_name, safe="")
+    urls: list[str] = []
+    if _has_trn_api_key():
+        urls.append(PUBLIC_API_URL.format(platform=platform, name=encoded))
+    urls.append(API_URL.format(platform=platform, name=encoded))
+    return urls
+
+
+def _season_urls(epic_name: str, platform: str, season: int) -> list[str]:
+    encoded = quote(epic_name, safe="")
+    suffix = f"?season={int(season)}"
+    urls: list[str] = []
+    if _has_trn_api_key():
+        urls.append(
+            PUBLIC_SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix
+        )
+    urls.append(SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix)
+    return urls
+
+
+
 def _pick_impersonate() -> str:
     global _impersonate
     if _impersonate:
@@ -188,10 +223,15 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
             f"No Rocket League profile found for {platform} player '{epic_name}'."
         )
 
-    if status == 403 or "you've been blocked" in body.lower():
+    if status == 401:
+        raise TrackerError(
+            "Tracker Network rejected the API key. Check that Railway `TRN_API_KEY` is valid."
+        )
+
+    if status == 403 or "you've been blocked" in body.lower() or "access denied" in body.lower():
         raise TrackerBlockedError(
             "Tracker Network blocked the request (Cloudflare). "
-            "This often happens on cloud hosts; retry later or set TRACKER_PROXY."
+            "Set a free `TRN_API_KEY` from https://tracker.gg/developers on Railway."
         )
 
     if status == 429:
@@ -264,10 +304,22 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
 
 
 def fetch_profile(epic_name: str, platform: str = "epic") -> dict[str, Any]:
-    encoded = quote(epic_name, safe="")
-    url = API_URL.format(platform=platform, name=encoded)
-    payload = _request_json(url, epic_name=epic_name, platform=platform)
-    return payload["data"]
+    last_error: Exception | None = None
+    for url in _profile_urls(epic_name, platform):
+        try:
+            payload = _request_json(url, epic_name=epic_name, platform=platform)
+            return payload["data"]
+        except PlayerNotFoundError:
+            raise
+        except TrackerError as exc:
+            # Bad API key should not silently fall through to the Cloudflare-blocked endpoint.
+            if "API key" in str(exc):
+                raise
+            last_error = exc
+            log.warning("Profile fetch failed via %s: %s", url.split("/")[2], exc)
+            continue
+    assert last_error is not None
+    raise last_error
 
 
 def fetch_season_playlists(
@@ -275,14 +327,19 @@ def fetch_season_playlists(
     season: int,
     platform: str = "epic",
 ) -> list[dict[str, Any]]:
-    encoded = quote(epic_name, safe="")
-    url = (
-        SEASON_PLAYLIST_URL.format(platform=platform, name=encoded)
-        + f"?season={int(season)}"
-    )
-    payload = _request_json(url, epic_name=epic_name, platform=platform, retries=2)
-    data = payload.get("data")
-    return data if isinstance(data, list) else []
+    last_error: Exception | None = None
+    for url in _season_urls(epic_name, platform, season):
+        try:
+            payload = _request_json(url, epic_name=epic_name, platform=platform, retries=2)
+            data = payload.get("data")
+            return data if isinstance(data, list) else []
+        except PlayerNotFoundError:
+            raise
+        except TrackerError as exc:
+            last_error = exc
+            continue
+    assert last_error is not None
+    raise last_error
 
 
 def _parse_current_playlist(segment: dict[str, Any]) -> PlaylistMMR | None:
@@ -391,7 +448,7 @@ def _fetch_all_time_peak(
         (s for s in seasons if s != current_season),
         reverse=True,
     )
-    lookback = os.getenv("PEAK_SEASON_LOOKBACK", "").strip()
+    lookback = os.getenv("PEAK_SEASON_LOOKBACK", "12").strip()
     if lookback.isdigit():
         seasons_to_fetch = seasons_to_fetch[: int(lookback)]
     delay = float(os.getenv("PEAK_SEASON_DELAY_SECONDS", "0.35"))
@@ -446,9 +503,22 @@ def parse_player_mmr(
     )
 
 
-def get_player_mmr(epic_name: str, platform: str = "epic") -> PlayerMMR:
+def get_player_mmr(
+    epic_name: str,
+    platform: str = "epic",
+    *,
+    include_all_time_peak: bool | None = None,
+) -> PlayerMMR:
+    if include_all_time_peak is None:
+        flag = os.getenv("PEAK_ALL_TIME", "1").strip().lower()
+        include_all_time_peak = flag not in {"0", "false", "no"}
     profile = fetch_profile(epic_name, platform=platform)
-    return parse_player_mmr(profile, epic_name, platform=platform, include_all_time_peak=True)
+    return parse_player_mmr(
+        profile,
+        epic_name,
+        platform=platform,
+        include_all_time_peak=include_all_time_peak,
+    )
 
 
 def _fmt_rank(playlist: PlaylistMMR | None) -> str:

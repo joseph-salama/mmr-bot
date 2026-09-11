@@ -51,11 +51,15 @@ FRIENDLY_NOT_FOUND = (
     "double-check the exact spelling and capitalization, then try again."
 )
 FRIENDLY_BLOCKED = (
-    "Tracker Network blocked the lookup (Cloudflare). "
-    "This is common on cloud hosts like Railway. Try again in a bit, "
-    "or ask the host admin to set a `TRACKER_PROXY` if it keeps happening."
+    "Tracker Network is blocking Railway (Cloudflare).\n"
+    "Fix: create a free API app at https://tracker.gg/developers , copy the key, "
+    "then add Railway variable `TRN_API_KEY` and redeploy."
 )
-FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now. Please try again shortly."
+FRIENDLY_TRACKER = (
+    "Couldn't reach Tracker Network right now.\n"
+    "If this keeps happening on Railway, add a free `TRN_API_KEY` from "
+    "https://tracker.gg/developers and redeploy."
+)
 FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
 
 
@@ -240,6 +244,11 @@ class MMRBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user and self.user.id)
+        if not os.getenv("TRN_API_KEY", "").strip():
+            log.warning(
+                "TRN_API_KEY is not set. Railway lookups will often fail due to Cloudflare. "
+                "Create a free key at https://tracker.gg/developers and add it to Railway variables."
+            )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Wrong channel: do not reply at all (no public or ephemeral message).
@@ -371,6 +380,7 @@ async def check_command(
     assert member is not None
 
     # /check @user  → refresh stored epic name
+    refresh_only = False
     if epic is None:
         existing = store.get(member.id)
         if existing is None:
@@ -388,11 +398,27 @@ async def check_command(
                 f"Use `/check @user epic_username` to link one.",
             )
             return
+        refresh_only = True
 
     try:
         entry = await fetch_and_store(member.id, epic)
     except (PlayerNotFoundError, TrackerError) as exc:
         log.warning("check failed for %s / %s: %s", member.id, epic, exc)
+        cached = store.get(member.id)
+        if refresh_only and cached:
+            embed = format_mmr_embed(
+                discord_user=member,
+                epic_name=cached.get("epic_name") or epic,
+                entry=cached,
+                title="Stored MMR (live refresh failed)",
+            )
+            await interaction.followup.send(embed=embed)
+            await send_error(
+                interaction,
+                friendly_tracker_error(exc)
+                + "\nShowing the last saved stats instead.",
+            )
+            return
         await send_error(interaction, friendly_tracker_error(exc))
         return
     except Exception:

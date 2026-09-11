@@ -66,14 +66,26 @@ class PlayerStore:
 
     def upsert(self, discord_id: int | str, epic_name: str, player: PlayerMMR) -> dict[str, Any]:
         data = self._read()
+        key = str(discord_id)
+        previous = data["players"].get(key)
         entry = {
-            "discord_id": str(discord_id),
+            "discord_id": key,
             "epic_name": player.epic_name or epic_name,
             "platform": player.platform,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "mmr": asdict(player),
         }
-        data["players"][str(discord_id)] = entry
+
+        # Keep the highest known all-time peak if a partial scan returned a lower value.
+        if previous:
+            old_peak = ((previous.get("mmr") or {}).get("peak_overall") or {})
+            new_peak = ((entry.get("mmr") or {}).get("peak_overall") or {})
+            old_mmr = old_peak.get("mmr")
+            new_mmr = new_peak.get("mmr")
+            if old_mmr is not None and (new_mmr is None or int(old_mmr) > int(new_mmr)):
+                entry["mmr"]["peak_overall"] = old_peak
+
+        data["players"][key] = entry
         self._write(data)
         return entry
 
