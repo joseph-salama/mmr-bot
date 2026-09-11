@@ -122,6 +122,7 @@ class TrackerBlockedError(TrackerError):
 _session: crequests.Session | None = None
 _session_lock = threading.Lock()
 _impersonate: str | None = None
+_flaresolverr_session_id: str | None = None
 
 
 def _clean_env(name: str) -> str:
@@ -129,17 +130,26 @@ def _clean_env(name: str) -> str:
     return value.strip().strip('"').strip("'")
 
 
+def _flaresolverr_endpoint() -> str | None:
+    raw = _clean_env("FLARESOLVERR_URL")
+    if not raw:
+        return None
+    if raw.endswith("/v1"):
+        return raw
+    return raw.rstrip("/") + "/v1"
+
+
 def config_status() -> str:
     """Short non-secret summary of fetch-related config (for logs/errors)."""
     trn = _clean_env("TRN_API_KEY")
-    scraper = _clean_env("SCRAPER_API_KEY")
-    zenrows = _clean_env("ZENROWS_API_KEY")
+    flare = _flaresolverr_endpoint()
     proxy = _clean_env("TRACKER_PROXY") or _clean_env("HTTPS_PROXY")
+    scraper = _clean_env("SCRAPER_API_KEY")
     return (
+        f"FLARESOLVERR={'yes' if flare else 'no'}, "
         f"TRN_API_KEY={'yes/' + str(len(trn)) if trn else 'no'}, "
-        f"SCRAPER_API_KEY={'yes' if scraper else 'no'}, "
-        f"ZENROWS_API_KEY={'yes' if zenrows else 'no'}, "
-        f"TRACKER_PROXY={'yes' if proxy else 'no'}"
+        f"TRACKER_PROXY={'yes' if proxy else 'no'}, "
+        f"SCRAPER_API_KEY={'yes' if scraper else 'no'}"
     )
 
 
@@ -190,17 +200,17 @@ def _trn_headers() -> dict[str, str]:
     return headers
 
 
-def _has_trn_api_key() -> bool:
-    return bool(_clean_env("TRN_API_KEY"))
+def _has_bypass() -> bool:
+    return bool(
+        _flaresolverr_endpoint()
+        or _clean_env("SCRAPER_API_KEY")
+        or _clean_env("ZENROWS_API_KEY")
+        or _proxy_dict()
+    )
 
 
 def _wrap_fetch_url(url: str) -> str:
-    """
-    Optionally route Tracker requests through a scraping proxy.
-
-    Railway/datacenter IPs are often Cloudflare-blocked. A scraper proxy
-    fetches from residential IPs and returns the upstream body.
-    """
+    """Optional paid scraping proxies (not required)."""
     scraper = _clean_env("SCRAPER_API_KEY")
     if scraper:
         return (
@@ -220,8 +230,6 @@ def _wrap_fetch_url(url: str) -> str:
 
 def _profile_urls(epic_name: str, platform: str) -> list[str]:
     encoded = quote(epic_name, safe="")
-    # Official public-api does not reliably support Rocket League.
-    # Prefer the site API (optionally via scraper proxy).
     return [API_URL.format(platform=platform, name=encoded)]
 
 
@@ -229,6 +237,76 @@ def _season_urls(epic_name: str, platform: str, season: int) -> list[str]:
     encoded = quote(epic_name, safe="")
     suffix = f"?season={int(season)}"
     return [SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix]
+
+
+def _ensure_flaresolverr_session(endpoint: str) -> str | None:
+    """Create/reuse a FlareSolverr browser session for Cloudflare cookies."""
+    global _flaresolverr_session_id
+    if _flaresolverr_session_id:
+        return _flaresolverr_session_id
+    try:
+        resp = crequests.post(
+            endpoint,
+            json={"cmd": "sessions.create"},
+            timeout=60,
+        )
+        payload = resp.json()
+        session_id = payload.get("session")
+        if session_id:
+            _flaresolverr_session_id = str(session_id)
+            log.info("Created FlareSolverr session %s", _flaresolverr_session_id)
+            return _flaresolverr_session_id
+    except Exception as exc:
+        log.warning("FlareSolverr session create failed: %s", exc)
+    return None
+
+
+def _flaresolverr_get(url: str) -> Any:
+    """
+    Fetch a URL through FlareSolverr (free, self-hosted Cloudflare bypass).
+
+    Expects FLARESOLVERR_URL like:
+      http://flaresolverr.railway.internal:8191/v1
+    """
+    endpoint = _flaresolverr_endpoint()
+    if not endpoint:
+        raise TrackerError("FLARESOLVERR_URL is not configured")
+
+    session_id = _ensure_flaresolverr_session(endpoint)
+    body: dict[str, Any] = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": int(_clean_env("FLARESOLVERR_TIMEOUT_MS") or "60000"),
+    }
+    if session_id:
+        body["session"] = session_id
+
+    try:
+        resp = crequests.post(endpoint, json=body, timeout=90)
+    except Exception as exc:
+        raise TrackerError(f"FlareSolverr request failed: {exc}") from exc
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        raise TrackerError("FlareSolverr returned invalid JSON") from exc
+
+    if payload.get("status") != "ok":
+        message = payload.get("message") or "FlareSolverr challenge failed"
+        raise TrackerBlockedError(f"FlareSolverr: {message}")
+
+    solution = payload.get("solution") or {}
+    status = int(solution.get("status") or 0)
+    text = solution.get("response") or ""
+
+    class _FakeResponse:
+        status_code = status
+        text = text
+
+        def json(self) -> Any:
+            return json.loads(self.text)
+
+    return _FakeResponse()
 
 
 
@@ -298,7 +376,7 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
     if status == 403 or "you've been blocked" in body.lower() or "access denied" in body.lower():
         raise TrackerBlockedError(
             "Tracker Network blocked the request (Cloudflare on Railway). "
-            "Add a free SCRAPER_API_KEY from https://www.scraperapi.com/ (or TRACKER_PROXY)."
+            "Deploy free FlareSolverr and set FLARESOLVERR_URL."
         )
 
     if status == 429:
@@ -325,8 +403,30 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
 
 
 def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) -> Any:
-    global _session, _impersonate
+    global _session, _impersonate, _flaresolverr_session_id
     last_error: Exception | None = None
+
+    # Prefer free self-hosted FlareSolverr when configured (best Railway option).
+    if _flaresolverr_endpoint():
+        for attempt in range(retries):
+            try:
+                response = _flaresolverr_get(url)
+                _raise_for_status(response, epic_name, platform)
+                return response.json()
+            except TrackerBlockedError as exc:
+                _flaresolverr_session_id = None
+                last_error = exc
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            except PlayerNotFoundError:
+                raise
+            except TrackerError as exc:
+                last_error = exc
+                time.sleep(0.8 * (attempt + 1))
+                continue
+        assert last_error is not None
+        raise last_error
+
     fetch_url = _wrap_fetch_url(url)
     using_scraper = fetch_url != url
 
@@ -336,8 +436,6 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
             with _session_lock:
                 if _session is None:
                     _session = _build_session()
-                # Scraper proxies need the target Accept headers less strictly;
-                # still send TRN key for the upstream when not wrapped.
                 headers = _trn_headers()
                 if using_scraper:
                     headers = {"Accept": "application/json"}
@@ -364,7 +462,7 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
             _impersonate = _IMPERSONATE_CANDIDATES[(idx + 1) % len(_IMPERSONATE_CANDIDATES)]
             last_error = TrackerBlockedError(
                 "Tracker Network blocked the request (Cloudflare on Railway). "
-                "Add a free SCRAPER_API_KEY from https://www.scraperapi.com/ (or TRACKER_PROXY)."
+                "Deploy free FlareSolverr and set FLARESOLVERR_URL."
             )
             time.sleep(1.2 * (attempt + 1))
             continue

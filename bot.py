@@ -53,9 +53,8 @@ FRIENDLY_NOT_FOUND = (
 )
 FRIENDLY_BLOCKED = (
     "Tracker Network is blocking Railway (Cloudflare).\n"
-    "`TRN_API_KEY` alone is not enough for Rocket League from cloud hosts.\n"
-    "Fix: create a free key at https://www.scraperapi.com/ → add Railway var "
-    "`SCRAPER_API_KEY` → redeploy."
+    "Free fix: deploy FlareSolverr in the same Railway project and set "
+    "`FLARESOLVERR_URL` on the bot service."
 )
 FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now."
 FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
@@ -246,14 +245,14 @@ class MMRBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user and self.user.id)
         log.info("Tracker fetch config: %s", config_status())
-        scraper = os.getenv("SCRAPER_API_KEY", "").strip().strip('"').strip("'")
+        flare = os.getenv("FLARESOLVERR_URL", "").strip().strip('"').strip("'")
         proxy = os.getenv("TRACKER_PROXY", "").strip()
-        if not scraper and not proxy:
+        if not flare and not proxy:
             log.warning(
-                "No SCRAPER_API_KEY or TRACKER_PROXY set. "
-                "Railway will likely be Cloudflare-blocked by Tracker Network. "
-                "TRN_API_KEY alone does not fix Rocket League lookups from cloud IPs. "
-                "Get a free key at https://www.scraperapi.com/"
+                "No FLARESOLVERR_URL set. Railway will likely be Cloudflare-blocked. "
+                "Deploy free FlareSolverr (Docker: ghcr.io/flaresolverr/flaresolverr) "
+                "in this Railway project and set FLARESOLVERR_URL="
+                "http://<flaresolverr-service>.railway.internal:8191/v1"
             )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
