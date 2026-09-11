@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from curl_cffi import requests as crequests
 
@@ -124,8 +124,27 @@ _session_lock = threading.Lock()
 _impersonate: str | None = None
 
 
+def _clean_env(name: str) -> str:
+    value = os.getenv(name, "") or ""
+    return value.strip().strip('"').strip("'")
+
+
+def config_status() -> str:
+    """Short non-secret summary of fetch-related config (for logs/errors)."""
+    trn = _clean_env("TRN_API_KEY")
+    scraper = _clean_env("SCRAPER_API_KEY")
+    zenrows = _clean_env("ZENROWS_API_KEY")
+    proxy = _clean_env("TRACKER_PROXY") or _clean_env("HTTPS_PROXY")
+    return (
+        f"TRN_API_KEY={'yes/' + str(len(trn)) if trn else 'no'}, "
+        f"SCRAPER_API_KEY={'yes' if scraper else 'no'}, "
+        f"ZENROWS_API_KEY={'yes' if zenrows else 'no'}, "
+        f"TRACKER_PROXY={'yes' if proxy else 'no'}"
+    )
+
+
 def _proxy_dict() -> dict[str, str] | None:
-    proxy = os.getenv("TRACKER_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    proxy = _clean_env("TRACKER_PROXY") or _clean_env("HTTPS_PROXY") or _clean_env("HTTP_PROXY")
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}
@@ -133,35 +152,51 @@ def _proxy_dict() -> dict[str, str] | None:
 
 def _trn_headers() -> dict[str, str]:
     headers = dict(HEADERS)
-    api_key = os.getenv("TRN_API_KEY")
+    api_key = _clean_env("TRN_API_KEY")
     if api_key:
         headers["TRN-Api-Key"] = api_key
     return headers
 
 
 def _has_trn_api_key() -> bool:
-    return bool(os.getenv("TRN_API_KEY", "").strip())
+    return bool(_clean_env("TRN_API_KEY"))
+
+
+def _wrap_fetch_url(url: str) -> str:
+    """
+    Optionally route Tracker requests through a scraping proxy.
+
+    Railway/datacenter IPs are often Cloudflare-blocked. A scraper proxy
+    fetches from residential IPs and returns the upstream body.
+    """
+    scraper = _clean_env("SCRAPER_API_KEY")
+    if scraper:
+        return (
+            "http://api.scraperapi.com/?"
+            + urlencode({"api_key": scraper, "url": url})
+        )
+
+    zenrows = _clean_env("ZENROWS_API_KEY")
+    if zenrows:
+        return (
+            "https://api.zenrows.com/v1/?"
+            + urlencode({"apikey": zenrows, "url": url})
+        )
+
+    return url
 
 
 def _profile_urls(epic_name: str, platform: str) -> list[str]:
     encoded = quote(epic_name, safe="")
-    urls: list[str] = []
-    if _has_trn_api_key():
-        urls.append(PUBLIC_API_URL.format(platform=platform, name=encoded))
-    urls.append(API_URL.format(platform=platform, name=encoded))
-    return urls
+    # Official public-api does not reliably support Rocket League.
+    # Prefer the site API (optionally via scraper proxy).
+    return [API_URL.format(platform=platform, name=encoded)]
 
 
 def _season_urls(epic_name: str, platform: str, season: int) -> list[str]:
     encoded = quote(epic_name, safe="")
     suffix = f"?season={int(season)}"
-    urls: list[str] = []
-    if _has_trn_api_key():
-        urls.append(
-            PUBLIC_SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix
-        )
-    urls.append(SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix)
-    return urls
+    return [SEASON_PLAYLIST_URL.format(platform=platform, name=encoded) + suffix]
 
 
 
@@ -230,8 +265,8 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
 
     if status == 403 or "you've been blocked" in body.lower() or "access denied" in body.lower():
         raise TrackerBlockedError(
-            "Tracker Network blocked the request (Cloudflare). "
-            "Set a free `TRN_API_KEY` from https://tracker.gg/developers on Railway."
+            "Tracker Network blocked the request (Cloudflare on Railway). "
+            "Add a free SCRAPER_API_KEY from https://www.scraperapi.com/ (or TRACKER_PROXY)."
         )
 
     if status == 429:
@@ -260,6 +295,8 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
 def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) -> Any:
     global _session, _impersonate
     last_error: Exception | None = None
+    fetch_url = _wrap_fetch_url(url)
+    using_scraper = fetch_url != url
 
     for attempt in range(retries):
         try:
@@ -267,9 +304,17 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
             with _session_lock:
                 if _session is None:
                     _session = _build_session()
-                response = _session.get(url, headers=_trn_headers(), timeout=30)
+                # Scraper proxies need the target Accept headers less strictly;
+                # still send TRN key for the upstream when not wrapped.
+                headers = _trn_headers()
+                if using_scraper:
+                    headers = {"Accept": "application/json"}
+                response = _session.get(fetch_url, headers=headers, timeout=45)
         except Exception as exc:
-            last_error = TrackerError(f"Request failed: {exc}")
+            short = str(exc)
+            if len(short) > 120:
+                short = short[:117] + "..."
+            last_error = TrackerError(f"Request failed: {short}")
             time.sleep(0.8 * (attempt + 1))
             continue
 
@@ -277,6 +322,8 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
             _raise_for_status(response, epic_name, platform)
             return response.json()
         except TrackerBlockedError:
+            if using_scraper:
+                raise
             _reset_session()
             idx = 0
             current = _pick_impersonate()
@@ -284,8 +331,8 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
                 idx = _IMPERSONATE_CANDIDATES.index(current)
             _impersonate = _IMPERSONATE_CANDIDATES[(idx + 1) % len(_IMPERSONATE_CANDIDATES)]
             last_error = TrackerBlockedError(
-                "Tracker Network blocked the request (Cloudflare). "
-                "This often happens on cloud hosts; retry later or set TRACKER_PROXY."
+                "Tracker Network blocked the request (Cloudflare on Railway). "
+                "Add a free SCRAPER_API_KEY from https://www.scraperapi.com/ (or TRACKER_PROXY)."
             )
             time.sleep(1.2 * (attempt + 1))
             continue
@@ -510,8 +557,9 @@ def get_player_mmr(
     include_all_time_peak: bool | None = None,
 ) -> PlayerMMR:
     if include_all_time_peak is None:
-        flag = os.getenv("PEAK_ALL_TIME", "1").strip().lower()
-        include_all_time_peak = flag not in {"0", "false", "no"}
+        # Default off for fast/reliable cloud lookups; Sunday/updatemmr can enable.
+        flag = _clean_env("PEAK_ALL_TIME") or "0"
+        include_all_time_peak = flag.lower() not in {"0", "false", "no"}
     profile = fetch_profile(epic_name, platform=platform)
     return parse_player_mmr(
         profile,

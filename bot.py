@@ -28,6 +28,7 @@ from rl_mmr import (
     PlayerNotFoundError,
     TrackerBlockedError,
     TrackerError,
+    config_status,
     get_player_mmr,
 )
 from storage import PlayerStore
@@ -52,15 +53,33 @@ FRIENDLY_NOT_FOUND = (
 )
 FRIENDLY_BLOCKED = (
     "Tracker Network is blocking Railway (Cloudflare).\n"
-    "Fix: create a free API app at https://tracker.gg/developers , copy the key, "
-    "then add Railway variable `TRN_API_KEY` and redeploy."
+    "`TRN_API_KEY` alone is not enough for Rocket League from cloud hosts.\n"
+    "Fix: create a free key at https://www.scraperapi.com/ → add Railway var "
+    "`SCRAPER_API_KEY` → redeploy."
 )
-FRIENDLY_TRACKER = (
-    "Couldn't reach Tracker Network right now.\n"
-    "If this keeps happening on Railway, add a free `TRN_API_KEY` from "
-    "https://tracker.gg/developers and redeploy."
-)
+FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now."
 FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
+
+
+def _sanitize_error_detail(text: str) -> str:
+    cleaned = " ".join((text or "").split())
+    if "<" in cleaned or "doctype" in cleaned.lower():
+        return "blocked/html response from Tracker Network"
+    if len(cleaned) > 140:
+        return cleaned[:137] + "..."
+    return cleaned
+
+
+def friendly_tracker_error(exc: Exception) -> str:
+    detail = _sanitize_error_detail(str(exc))
+    status = config_status()
+    if isinstance(exc, PlayerNotFoundError):
+        return FRIENDLY_NOT_FOUND
+    if isinstance(exc, TrackerBlockedError):
+        return f"{FRIENDLY_BLOCKED}\nDetails: {detail}\nConfig: {status}"
+    if isinstance(exc, TrackerError):
+        return f"{FRIENDLY_TRACKER}\nDetails: {detail}\nConfig: {status}"
+    return f"{FRIENDLY_GENERIC}\nDetails: {detail}\nConfig: {status}"
 
 
 def _rank_line(label: str, playlist: dict | None) -> str:
@@ -204,24 +223,6 @@ async def send_error(interaction: discord.Interaction, message: str) -> None:
         log.warning("Failed to send ephemeral error to user")
 
 
-def friendly_tracker_error(exc: Exception) -> str:
-    if isinstance(exc, PlayerNotFoundError):
-        return FRIENDLY_NOT_FOUND
-    if isinstance(exc, TrackerBlockedError):
-        return FRIENDLY_BLOCKED
-    if isinstance(exc, TrackerError):
-        text = str(exc).strip()
-        if text:
-            # Keep short/clean; never dump HTML bodies.
-            if "<" in text or "doctype" in text.lower():
-                return FRIENDLY_TRACKER
-            if len(text) > 180:
-                return FRIENDLY_TRACKER
-            return f"Tracker Network error: {text}"
-        return FRIENDLY_TRACKER
-    return FRIENDLY_GENERIC
-
-
 class MMRBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -244,10 +245,15 @@ class MMRBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user and self.user.id)
-        if not os.getenv("TRN_API_KEY", "").strip():
+        log.info("Tracker fetch config: %s", config_status())
+        scraper = os.getenv("SCRAPER_API_KEY", "").strip().strip('"').strip("'")
+        proxy = os.getenv("TRACKER_PROXY", "").strip()
+        if not scraper and not proxy:
             log.warning(
-                "TRN_API_KEY is not set. Railway lookups will often fail due to Cloudflare. "
-                "Create a free key at https://tracker.gg/developers and add it to Railway variables."
+                "No SCRAPER_API_KEY or TRACKER_PROXY set. "
+                "Railway will likely be Cloudflare-blocked by Tracker Network. "
+                "TRN_API_KEY alone does not fix Rocket League lookups from cloud IPs. "
+                "Get a free key at https://www.scraperapi.com/"
             )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -314,8 +320,18 @@ async def on_app_command_error(
     await send_error(interaction, FRIENDLY_GENERIC)
 
 
-async def fetch_and_store(discord_id: int, epic_name: str) -> dict:
-    player = await asyncio.to_thread(get_player_mmr, epic_name)
+async def fetch_and_store(
+    discord_id: int,
+    epic_name: str,
+    *,
+    include_all_time_peak: bool | None = None,
+) -> dict:
+    player = await asyncio.to_thread(
+        get_player_mmr,
+        epic_name,
+        "epic",
+        include_all_time_peak=include_all_time_peak,
+    )
     return store.upsert(discord_id, epic_name, player)
 
 
@@ -329,7 +345,8 @@ async def refresh_all_players() -> tuple[int, int]:
             failed += 1
             continue
         try:
-            await fetch_and_store(int(discord_id), epic_name)
+            # Bulk/Sunday updates scan recent seasons for all-time peak.
+            await fetch_and_store(int(discord_id), epic_name, include_all_time_peak=True)
             updated += 1
         except (PlayerNotFoundError, TrackerError) as exc:
             failed += 1
