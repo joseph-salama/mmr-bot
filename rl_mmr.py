@@ -11,15 +11,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import quote
 
 from curl_cffi import requests as crequests
 
+log = logging.getLogger("rl_mmr")
+
 API_URL = (
     "https://api.tracker.gg/api/v2/rocket-league/standard/profile/{platform}/{name}"
+)
+SEASON_PLAYLIST_URL = (
+    "https://api.tracker.gg/api/v2/rocket-league/standard/profile/"
+    "{platform}/{name}/segments/playlist"
 )
 
 # Current-season competitive playlist IDs used by Tracker Network / Psyonix.
@@ -41,10 +51,20 @@ DIVISION_NAMES = {
 }
 
 HEADERS = {
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://tracker.gg",
-    "Referer": "https://tracker.gg/",
+    "Referer": "https://tracker.gg/rocket-league",
 }
+
+# curl_cffi impersonation profiles to try (first available wins per request path).
+_IMPERSONATE_CANDIDATES = (
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "chrome110",
+    "chrome",
+)
 
 
 @dataclass
@@ -86,6 +106,69 @@ class TrackerError(Exception):
     pass
 
 
+class TrackerBlockedError(TrackerError):
+    """Cloudflare / Tracker Network blocked the request."""
+
+
+_session: crequests.Session | None = None
+_session_lock = threading.Lock()
+_impersonate: str | None = None
+
+
+def _proxy_dict() -> dict[str, str] | None:
+    proxy = os.getenv("TRACKER_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
+def _trn_headers() -> dict[str, str]:
+    headers = dict(HEADERS)
+    api_key = os.getenv("TRN_API_KEY")
+    if api_key:
+        headers["TRN-Api-Key"] = api_key
+    return headers
+
+
+def _pick_impersonate() -> str:
+    global _impersonate
+    if _impersonate:
+        return _impersonate
+    configured = os.getenv("TRACKER_IMPERSONATE")
+    if configured:
+        _impersonate = configured
+        return _impersonate
+    _impersonate = _IMPERSONATE_CANDIDATES[0]
+    return _impersonate
+
+
+def _reset_session() -> None:
+    global _session
+    with _session_lock:
+        _session = None
+
+
+def _build_session() -> crequests.Session:
+    session = crequests.Session(impersonate=_pick_impersonate())
+    proxies = _proxy_dict()
+    if proxies:
+        session.proxies.update(proxies)
+
+    # Warm Cloudflare cookies the same way a browser would.
+    try:
+        session.get(
+            "https://tracker.gg/rocket-league",
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        log.warning("Tracker warmup request failed: %s", exc)
+    return session
+
+
 def _stat_value(stats: dict[str, Any], key: str) -> Any:
     entry = stats.get(key) or {}
     return entry.get("value")
@@ -96,40 +179,110 @@ def _stat_meta(stats: dict[str, Any], key: str, meta_key: str) -> Any:
     return (entry.get("metadata") or {}).get(meta_key)
 
 
-def _peak_meta(stats: dict[str, Any], meta_key: str) -> Any:
-    return _stat_meta(stats, "peakRating", meta_key)
+def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
+    status = response.status_code
+    body = response.text or ""
+
+    if status == 404:
+        raise PlayerNotFoundError(
+            f"No Rocket League profile found for {platform} player '{epic_name}'."
+        )
+
+    if status == 403 or "you've been blocked" in body.lower():
+        raise TrackerBlockedError(
+            "Tracker Network blocked the request (Cloudflare). "
+            "This often happens on cloud hosts; retry later or set TRACKER_PROXY."
+        )
+
+    if status == 429:
+        raise TrackerError("Tracker Network rate-limited the bot. Try again in a minute.")
+
+    if status != 200:
+        raise TrackerError(f"Tracker Network returned HTTP {status}.")
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise TrackerError("Tracker Network returned an invalid response.") from exc
+
+    if "errors" in payload:
+        messages = "; ".join(
+            err.get("message", str(err)) for err in payload.get("errors", [])
+        )
+        lowered = messages.lower()
+        if "not found" in lowered or "no stats" in lowered:
+            raise PlayerNotFoundError(
+                f"No Rocket League profile found for {platform} player '{epic_name}'."
+            )
+        raise TrackerError(messages or "Unknown Tracker Network error")
+
+
+def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) -> Any:
+    global _session, _impersonate
+    last_error: Exception | None = None
+
+    for attempt in range(retries):
+        try:
+            # Serialize session use (curl_cffi sessions are not thread-safe).
+            with _session_lock:
+                if _session is None:
+                    _session = _build_session()
+                response = _session.get(url, headers=_trn_headers(), timeout=30)
+        except Exception as exc:
+            last_error = TrackerError(f"Request failed: {exc}")
+            time.sleep(0.8 * (attempt + 1))
+            continue
+
+        try:
+            _raise_for_status(response, epic_name, platform)
+            return response.json()
+        except TrackerBlockedError:
+            _reset_session()
+            idx = 0
+            current = _pick_impersonate()
+            if current in _IMPERSONATE_CANDIDATES:
+                idx = _IMPERSONATE_CANDIDATES.index(current)
+            _impersonate = _IMPERSONATE_CANDIDATES[(idx + 1) % len(_IMPERSONATE_CANDIDATES)]
+            last_error = TrackerBlockedError(
+                "Tracker Network blocked the request (Cloudflare). "
+                "This often happens on cloud hosts; retry later or set TRACKER_PROXY."
+            )
+            time.sleep(1.2 * (attempt + 1))
+            continue
+        except TrackerError as exc:
+            msg = str(exc).lower()
+            if "rate-limited" in msg or "http 429" in msg:
+                last_error = exc
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            raise
+        except PlayerNotFoundError:
+            raise
+
+    assert last_error is not None
+    raise last_error
 
 
 def fetch_profile(epic_name: str, platform: str = "epic") -> dict[str, Any]:
     encoded = quote(epic_name, safe="")
     url = API_URL.format(platform=platform, name=encoded)
-    try:
-        response = crequests.get(
-            url,
-            impersonate="chrome",
-            headers=HEADERS,
-            timeout=30,
-        )
-    except Exception as exc:  # network / TLS failures
-        raise TrackerError(f"Request failed: {exc}") from exc
-
-    if response.status_code == 404:
-        raise PlayerNotFoundError(
-            f"No Rocket League profile found for {platform} player '{epic_name}'."
-        )
-    if response.status_code != 200:
-        raise TrackerError(
-            f"Tracker Network returned HTTP {response.status_code}: {response.text[:300]}"
-        )
-
-    payload = response.json()
-    if "errors" in payload:
-        messages = "; ".join(
-            err.get("message", str(err)) for err in payload.get("errors", [])
-        )
-        raise TrackerError(messages or "Unknown Tracker Network error")
-
+    payload = _request_json(url, epic_name=epic_name, platform=platform)
     return payload["data"]
+
+
+def fetch_season_playlists(
+    epic_name: str,
+    season: int,
+    platform: str = "epic",
+) -> list[dict[str, Any]]:
+    encoded = quote(epic_name, safe="")
+    url = (
+        SEASON_PLAYLIST_URL.format(platform=platform, name=encoded)
+        + f"?season={int(season)}"
+    )
+    payload = _request_json(url, epic_name=epic_name, platform=platform, retries=2)
+    data = payload.get("data")
+    return data if isinstance(data, list) else []
 
 
 def _parse_current_playlist(segment: dict[str, Any]) -> PlaylistMMR | None:
@@ -154,58 +307,117 @@ def _parse_current_playlist(segment: dict[str, Any]) -> PlaylistMMR | None:
     )
 
 
+def _peak_from_segment(segment: dict[str, Any]) -> PeakOverall | None:
+    if segment.get("type") != "playlist":
+        return None
+
+    attrs = segment.get("attributes") or {}
+    playlist_id = attrs.get("playlistId")
+    if playlist_id not in PEAK_PLAYLIST_IDS:
+        return None
+
+    stats = segment.get("stats") or {}
+    peak = _stat_value(stats, "peakRating")
+    if peak is None:
+        # Older seasons sometimes only expose the end-of-season rating.
+        peak = _stat_value(stats, "rating")
+    if peak is None:
+        return None
+
+    meta = (stats.get("peakRating") or {}).get("metadata") or {}
+    name = (segment.get("metadata") or {}).get("name") or meta.get("name") or "Unknown"
+    tier = meta.get("tierName") or meta.get("name") or _stat_meta(stats, "tier", "name")
+    division = meta.get("division") or _stat_meta(stats, "division", "name")
+    if division is None:
+        div_idx = _stat_value(stats, "peakDivision")
+        if isinstance(div_idx, int):
+            division = DIVISION_NAMES.get(div_idx)
+
+    season = attrs.get("season")
+    if season is None and isinstance(meta.get("season"), str):
+        text = meta["season"]
+        if "(" in text and text.endswith(")"):
+            try:
+                season = int(text.rsplit("(", 1)[1].rstrip(")"))
+            except ValueError:
+                season = None
+
+    return PeakOverall(
+        mmr=int(peak),
+        playlist=name,
+        playlist_id=int(playlist_id),
+        season=season,
+        tier=tier,
+        division=division,
+    )
+
+
 def _iter_peak_candidates(segments: list[dict[str, Any]]) -> list[PeakOverall]:
-    """Collect peak MMR entries from current + historical playlist segments."""
     peaks: list[PeakOverall] = []
-
     for segment in segments:
-        if segment.get("type") != "playlist":
-            continue
-
-        attrs = segment.get("attributes") or {}
-        playlist_id = attrs.get("playlistId")
-        if playlist_id not in PEAK_PLAYLIST_IDS:
-            continue
-
-        stats = segment.get("stats") or {}
-        peak = _stat_value(stats, "peakRating")
-        if peak is None:
-            continue
-
-        meta = (stats.get("peakRating") or {}).get("metadata") or {}
-        name = (segment.get("metadata") or {}).get("name") or meta.get("name") or "Unknown"
-        tier = meta.get("tierName") or meta.get("name")
-        division = meta.get("division")
-        if division is None:
-            div_idx = _stat_value(stats, "peakDivision")
-            if isinstance(div_idx, int):
-                division = DIVISION_NAMES.get(div_idx)
-
-        season = attrs.get("season")
-        if season is None and isinstance(meta.get("season"), str):
-            # Historical peaks look like: "Season 23 (37)"
-            text = meta["season"]
-            if "(" in text and text.endswith(")"):
-                try:
-                    season = int(text.rsplit("(", 1)[1].rstrip(")"))
-                except ValueError:
-                    season = None
-
-        peaks.append(
-            PeakOverall(
-                mmr=int(peak),
-                playlist=name,
-                playlist_id=int(playlist_id),
-                season=season,
-                tier=tier,
-                division=division,
-            )
-        )
-
+        parsed = _peak_from_segment(segment)
+        if parsed is not None:
+            peaks.append(parsed)
     return peaks
 
 
-def parse_player_mmr(profile: dict[str, Any], epic_name: str) -> PlayerMMR:
+def _available_seasons(profile: dict[str, Any]) -> list[int]:
+    seasons: set[int] = set()
+    current = (profile.get("metadata") or {}).get("currentSeason")
+    if isinstance(current, int):
+        seasons.add(current)
+
+    for segment in profile.get("availableSegments") or []:
+        if segment.get("type") != "playlist":
+            continue
+        season = (segment.get("attributes") or {}).get("season")
+        if isinstance(season, int):
+            seasons.add(season)
+
+    return sorted(seasons)
+
+
+def _fetch_all_time_peak(
+    epic_name: str,
+    platform: str,
+    profile: dict[str, Any],
+) -> PeakOverall | None:
+    """Scan every available season for the highest ranked 1s/2s/3s peak."""
+    peaks = _iter_peak_candidates(profile.get("segments") or [])
+    seasons = _available_seasons(profile)
+    current_season = (profile.get("metadata") or {}).get("currentSeason")
+    # Newest seasons first — more likely to matter, and fail soft if rate-limited later.
+    seasons_to_fetch = sorted(
+        (s for s in seasons if s != current_season),
+        reverse=True,
+    )
+    lookback = os.getenv("PEAK_SEASON_LOOKBACK", "").strip()
+    if lookback.isdigit():
+        seasons_to_fetch = seasons_to_fetch[: int(lookback)]
+    delay = float(os.getenv("PEAK_SEASON_DELAY_SECONDS", "0.35"))
+
+    for season in seasons_to_fetch:
+        try:
+            segments = fetch_season_playlists(epic_name, season, platform=platform)
+        except (PlayerNotFoundError, TrackerError) as exc:
+            log.warning("Season %s peak fetch failed for %s: %s", season, epic_name, exc)
+            # Back off a bit harder after failures, then keep scanning.
+            time.sleep(max(delay, 1.0))
+            continue
+        peaks.extend(_iter_peak_candidates(segments))
+        if delay > 0:
+            time.sleep(delay)
+
+    return max(peaks, key=lambda p: p.mmr) if peaks else None
+
+
+def parse_player_mmr(
+    profile: dict[str, Any],
+    epic_name: str,
+    *,
+    platform: str = "epic",
+    include_all_time_peak: bool = True,
+) -> PlayerMMR:
     segments = profile.get("segments") or []
     current: dict[int, PlaylistMMR] = {}
 
@@ -218,12 +430,15 @@ def parse_player_mmr(profile: dict[str, Any], epic_name: str) -> PlayerMMR:
         # Prefer the segment that has live rating data for this playlist.
         current[parsed.playlist_id] = parsed
 
-    peaks = _iter_peak_candidates(segments)
-    peak_overall = max(peaks, key=lambda p: p.mmr) if peaks else None
+    if include_all_time_peak:
+        peak_overall = _fetch_all_time_peak(epic_name, platform, profile)
+    else:
+        peaks = _iter_peak_candidates(segments)
+        peak_overall = max(peaks, key=lambda p: p.mmr) if peaks else None
 
     return PlayerMMR(
         epic_name=profile.get("platformInfo", {}).get("platformUserHandle") or epic_name,
-        platform=profile.get("platformInfo", {}).get("platformSlug") or "epic",
+        platform=profile.get("platformInfo", {}).get("platformSlug") or platform,
         current_season=(profile.get("metadata") or {}).get("currentSeason"),
         doubles_2v2=current.get(PLAYLIST_DOUBLES),
         standard_3v3=current.get(PLAYLIST_STANDARD),
@@ -233,7 +448,7 @@ def parse_player_mmr(profile: dict[str, Any], epic_name: str) -> PlayerMMR:
 
 def get_player_mmr(epic_name: str, platform: str = "epic") -> PlayerMMR:
     profile = fetch_profile(epic_name, platform=platform)
-    return parse_player_mmr(profile, epic_name)
+    return parse_player_mmr(profile, epic_name, platform=platform, include_all_time_peak=True)
 
 
 def _fmt_rank(playlist: PlaylistMMR | None) -> str:

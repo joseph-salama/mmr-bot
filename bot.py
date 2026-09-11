@@ -24,7 +24,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from rl_mmr import PlayerNotFoundError, TrackerError, get_player_mmr
+from rl_mmr import (
+    PlayerNotFoundError,
+    TrackerBlockedError,
+    TrackerError,
+    get_player_mmr,
+)
 from storage import PlayerStore
 
 logging.basicConfig(
@@ -40,6 +45,18 @@ SUNDAY_UPDATE_HOUR = int(os.getenv("SUNDAY_UPDATE_HOUR", "12"))
 UPDATE_DELAY_SECONDS = float(os.getenv("UPDATE_DELAY_SECONDS", "1.5"))
 
 store = PlayerStore()
+
+FRIENDLY_NOT_FOUND = (
+    "Couldn't find that Epic username. Epic names are **case-sensitive** — "
+    "double-check the exact spelling and capitalization, then try again."
+)
+FRIENDLY_BLOCKED = (
+    "Tracker Network blocked the lookup (Cloudflare). "
+    "This is common on cloud hosts like Railway. Try again in a bit, "
+    "or ask the host admin to set a `TRACKER_PROXY` if it keeps happening."
+)
+FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now. Please try again shortly."
+FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
 
 
 def _rank_line(label: str, playlist: dict | None) -> str:
@@ -72,6 +89,18 @@ def _short_mmr(playlist: dict | None) -> str:
     if not playlist or playlist.get("mmr") is None:
         return "N/A"
     return str(playlist["mmr"])
+
+
+def _entry_sort_mmr(entry: dict) -> int:
+    """Highest known MMR among current 2s/3s and all-time peak."""
+    mmr = entry.get("mmr") or {}
+    values: list[int] = []
+    for key in ("doubles_2v2", "standard_3v3", "peak_overall"):
+        block = mmr.get(key) or {}
+        value = block.get("mmr")
+        if value is not None:
+            values.append(int(value))
+    return max(values) if values else -1
 
 
 def format_mmr_embed(
@@ -108,19 +137,22 @@ def format_mmr_embed(
 
 
 def format_player_list_embeds(players: dict[str, dict]) -> list[discord.Embed]:
-    """Build one or more embeds listing every stored player."""
-    lines: list[str] = []
-    for discord_id, entry in sorted(
+    """Build one or more embeds listing every stored player (highest MMR first)."""
+    ranked = sorted(
         players.items(),
-        key=lambda item: (item[1].get("epic_name") or "").lower(),
-    ):
+        key=lambda item: _entry_sort_mmr(item[1]),
+        reverse=True,
+    )
+
+    lines: list[str] = []
+    for place, (discord_id, entry) in enumerate(ranked, start=1):
         mmr = entry.get("mmr") or {}
         epic = entry.get("epic_name") or "Unknown"
         twos = _short_mmr(mmr.get("doubles_2v2"))
         threes = _short_mmr(mmr.get("standard_3v3"))
         peak = _short_mmr(mmr.get("peak_overall"))
         lines.append(
-            f"<@{discord_id}> · **{epic}**\n"
+            f"**#{place}** <@{discord_id}> · **{epic}**\n"
             f"2s: `{twos}` · 3s: `{threes}` · Peak: `{peak}`"
         )
 
@@ -128,7 +160,6 @@ def format_player_list_embeds(players: dict[str, dict]) -> list[discord.Embed]:
     chunk: list[str] = []
     size = 0
     for line in lines:
-        # +2 for the blank line separator between entries
         extra = len(line) + (2 if chunk else 0)
         if chunk and size + extra > 3800:
             embed = discord.Embed(
@@ -154,8 +185,37 @@ def format_player_list_embeds(players: dict[str, dict]) -> list[discord.Embed]:
         embeds.append(embed)
 
     if embeds:
-        embeds[-1].set_footer(text=f"{len(players)} player(s) stored")
+        embeds[-1].set_footer(text=f"{len(players)} player(s) · sorted highest MMR first")
     return embeds
+
+
+async def send_error(interaction: discord.Interaction, message: str) -> None:
+    """User-only error reply (never posts publicly in the channel)."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        log.warning("Failed to send ephemeral error to user")
+
+
+def friendly_tracker_error(exc: Exception) -> str:
+    if isinstance(exc, PlayerNotFoundError):
+        return FRIENDLY_NOT_FOUND
+    if isinstance(exc, TrackerBlockedError):
+        return FRIENDLY_BLOCKED
+    if isinstance(exc, TrackerError):
+        text = str(exc).strip()
+        if text:
+            # Keep short/clean; never dump HTML bodies.
+            if "<" in text or "doctype" in text.lower():
+                return FRIENDLY_TRACKER
+            if len(text) > 180:
+                return FRIENDLY_TRACKER
+            return f"Tracker Network error: {text}"
+        return FRIENDLY_TRACKER
+    return FRIENDLY_GENERIC
 
 
 class MMRBot(commands.Bot):
@@ -242,14 +302,7 @@ async def on_app_command_error(
     if isinstance(error, app_commands.CheckFailure):
         return
     log.exception("App command error: %s", error)
-    message = "Something went wrong running that command."
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message)
-        else:
-            await interaction.response.send_message(message)
-    except discord.HTTPException:
-        pass
+    await send_error(interaction, FRIENDLY_GENERIC)
 
 
 async def fetch_and_store(discord_id: int, epic_name: str) -> dict:
@@ -299,19 +352,19 @@ async def check_command(
     if member is None and epic is None:
         players = store.all_players()
         if not players:
-            await interaction.followup.send("No players stored yet.")
+            await send_error(interaction, "No players stored yet.")
             return
         embeds = format_player_list_embeds(players)
-        # Discord allows up to 10 embeds per message.
         for i in range(0, len(embeds), 10):
             await interaction.followup.send(embeds=embeds[i : i + 10])
         return
 
     # username without @user
     if member is None and epic is not None:
-        await interaction.followup.send(
+        await send_error(
+            interaction,
             "Mention a Discord user when linking an Epic username.\n"
-            "Usage: `/check @user epic_username`"
+            "Usage: `/check @user epic_username`",
         )
         return
 
@@ -321,31 +374,30 @@ async def check_command(
     if epic is None:
         existing = store.get(member.id)
         if existing is None:
-            await interaction.followup.send(
+            await send_error(
+                interaction,
                 f"{member.mention} is not linked yet. "
-                f"Use `/check @user epic_username` first."
+                f"Use `/check @user epic_username` first.",
             )
             return
         epic = existing.get("epic_name")
         if not epic:
-            await interaction.followup.send(
+            await send_error(
+                interaction,
                 f"{member.mention} has no Epic username stored. "
-                f"Use `/check @user epic_username` to link one."
+                f"Use `/check @user epic_username` to link one.",
             )
             return
 
-    # /check @user epic_username  (or refresh path above)
     try:
         entry = await fetch_and_store(member.id, epic)
-    except PlayerNotFoundError as exc:
-        await interaction.followup.send(f"Could not find that player: {exc}")
-        return
-    except TrackerError as exc:
-        await interaction.followup.send(f"Tracker Network error: {exc}")
+    except (PlayerNotFoundError, TrackerError) as exc:
+        log.warning("check failed for %s / %s: %s", member.id, epic, exc)
+        await send_error(interaction, friendly_tracker_error(exc))
         return
     except Exception:
         log.exception("check failed for %s / %s", member.id, epic)
-        await interaction.followup.send("Something went wrong while fetching MMR.")
+        await send_error(interaction, FRIENDLY_GENERIC)
         return
 
     embed = format_mmr_embed(
@@ -365,7 +417,7 @@ async def updatemmr_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     players = store.all_players()
     if not players:
-        await interaction.followup.send("No players are stored yet. Use `/check` first.")
+        await send_error(interaction, "No players are stored yet. Use `/check` first.")
         return
 
     updated, failed = await refresh_all_players()
@@ -389,9 +441,7 @@ async def delete_command(
             f"Removed {member.mention} and their MMR from storage."
         )
     else:
-        await interaction.response.send_message(
-            f"{member.mention} was not linked in storage."
-        )
+        await send_error(interaction, f"{member.mention} was not linked in storage.")
 
 
 def main() -> None:
