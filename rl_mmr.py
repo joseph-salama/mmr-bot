@@ -147,6 +147,38 @@ def _proxy_dict() -> dict[str, str] | None:
     proxy = _clean_env("TRACKER_PROXY") or _clean_env("HTTPS_PROXY") or _clean_env("HTTP_PROXY")
     if not proxy:
         return None
+
+    # Ignore leftover example values from .env.example / docs.
+    lowered = proxy.lower()
+    if (
+        "user:pass@host" in lowered
+        or "@host:port" in lowered
+        or "example.com" in lowered
+        or "your-proxy" in lowered
+    ):
+        log.warning("Ignoring placeholder proxy value in env: %s", proxy)
+        return None
+
+    # Basic sanity: must look like a URL with a numeric port if a port is present.
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(proxy)
+        if parsed.scheme not in {"http", "https", "socks5", "socks5h", "socks4"}:
+            log.warning("Ignoring proxy with unsupported scheme: %s", proxy)
+            return None
+        if parsed.port is None and "://" in proxy:
+            # host:port missing or non-numeric → curl error (5)
+            if parsed.netloc and ":" in parsed.netloc.split("@")[-1]:
+                hostport = parsed.netloc.split("@")[-1]
+                port = hostport.rsplit(":", 1)[-1]
+                if not port.isdigit():
+                    log.warning("Ignoring proxy with invalid port: %s", proxy)
+                    return None
+    except Exception:
+        log.warning("Ignoring unparsable proxy value: %s", proxy)
+        return None
+
     return {"http": proxy, "https": proxy}
 
 
