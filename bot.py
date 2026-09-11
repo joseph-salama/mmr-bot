@@ -1,8 +1,10 @@
 """
 Discord bot: look up Rocket League MMR by Epic name, persist per Discord user.
 
-Commands (allowed channel only):
-  /check @user epic_username
+Commands (allowed channel only; silent everywhere else):
+  /check                         → list all stored players
+  /check @user                   → refresh & show that player's MMR
+  /check @user epic_username     → fetch, link, save, and show
   /updatemmr
   /delete @user
 
@@ -66,6 +68,12 @@ def _peak_line(peak: dict | None) -> str:
     return f"**Peak overall:** {peak['mmr']} MMR ({', '.join(parts)})"
 
 
+def _short_mmr(playlist: dict | None) -> str:
+    if not playlist or playlist.get("mmr") is None:
+        return "N/A"
+    return str(playlist["mmr"])
+
+
 def format_mmr_embed(
     *,
     discord_user: discord.abc.User,
@@ -99,6 +107,57 @@ def format_mmr_embed(
     return embed
 
 
+def format_player_list_embeds(players: dict[str, dict]) -> list[discord.Embed]:
+    """Build one or more embeds listing every stored player."""
+    lines: list[str] = []
+    for discord_id, entry in sorted(
+        players.items(),
+        key=lambda item: (item[1].get("epic_name") or "").lower(),
+    ):
+        mmr = entry.get("mmr") or {}
+        epic = entry.get("epic_name") or "Unknown"
+        twos = _short_mmr(mmr.get("doubles_2v2"))
+        threes = _short_mmr(mmr.get("standard_3v3"))
+        peak = _short_mmr(mmr.get("peak_overall"))
+        lines.append(
+            f"<@{discord_id}> · **{epic}**\n"
+            f"2s: `{twos}` · 3s: `{threes}` · Peak: `{peak}`"
+        )
+
+    embeds: list[discord.Embed] = []
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        # +2 for the blank line separator between entries
+        extra = len(line) + (2 if chunk else 0)
+        if chunk and size + extra > 3800:
+            embed = discord.Embed(
+                title="Stored players" if not embeds else "Stored players (cont.)",
+                description="\n\n".join(chunk),
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(ZoneInfo("UTC")),
+            )
+            embeds.append(embed)
+            chunk = [line]
+            size = len(line)
+        else:
+            chunk.append(line)
+            size += extra
+
+    if chunk:
+        embed = discord.Embed(
+            title="Stored players" if not embeds else "Stored players (cont.)",
+            description="\n\n".join(chunk),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(ZoneInfo("UTC")),
+        )
+        embeds.append(embed)
+
+    if embeds:
+        embeds[-1].set_footer(text=f"{len(players)} player(s) stored")
+    return embeds
+
+
 class MMRBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -123,14 +182,8 @@ class MMRBot(commands.Bot):
         log.info("Logged in as %s (%s)", self.user, self.user and self.user.id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.channel_id != ALLOWED_CHANNEL_ID:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "This bot only works in the designated MMR channel.",
-                    ephemeral=True,
-                )
-            return False
-        return True
+        # Wrong channel: do not reply at all (no public or ephemeral message).
+        return interaction.channel_id == ALLOWED_CHANNEL_ID
 
     @tasks.loop(minutes=15)
     async def sunday_update_loop(self) -> None:
@@ -180,6 +233,25 @@ class MMRBot(commands.Bot):
 bot = MMRBot()
 
 
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    # Wrong-channel CheckFailure: stay completely silent (no reply at all).
+    if isinstance(error, app_commands.CheckFailure):
+        return
+    log.exception("App command error: %s", error)
+    message = "Something went wrong running that command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message)
+        else:
+            await interaction.response.send_message(message)
+    except discord.HTTPException:
+        pass
+
+
 async def fetch_and_store(discord_id: int, epic_name: str) -> dict:
     player = await asyncio.to_thread(get_player_mmr, epic_name)
     return store.upsert(discord_id, epic_name, player)
@@ -209,25 +281,62 @@ async def refresh_all_players() -> tuple[int, int]:
 
 @bot.tree.command(
     name="check",
-    description="Look up a player's Rocket League MMR and link it to their Discord account.",
+    description="List all players, refresh one linked player, or link a new Epic username.",
 )
 @app_commands.describe(
-    member="Discord user to link",
-    username="Epic Games display name",
+    member="Discord user (optional). Alone = refresh their MMR. With username = link them.",
+    username="Epic Games display name (optional). Required when linking a new player.",
 )
 async def check_command(
     interaction: discord.Interaction,
-    member: discord.Member,
-    username: str,
+    member: discord.Member | None = None,
+    username: str | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
-    username = username.strip()
-    if not username:
-        await interaction.followup.send("Please provide an Epic username.", ephemeral=True)
+    epic = (username or "").strip() or None
+
+    # /check  → list everyone
+    if member is None and epic is None:
+        players = store.all_players()
+        if not players:
+            await interaction.followup.send("No players stored yet.")
+            return
+        embeds = format_player_list_embeds(players)
+        # Discord allows up to 10 embeds per message.
+        for i in range(0, len(embeds), 10):
+            await interaction.followup.send(embeds=embeds[i : i + 10])
         return
 
+    # username without @user
+    if member is None and epic is not None:
+        await interaction.followup.send(
+            "Mention a Discord user when linking an Epic username.\n"
+            "Usage: `/check @user epic_username`"
+        )
+        return
+
+    assert member is not None
+
+    # /check @user  → refresh stored epic name
+    if epic is None:
+        existing = store.get(member.id)
+        if existing is None:
+            await interaction.followup.send(
+                f"{member.mention} is not linked yet. "
+                f"Use `/check @user epic_username` first."
+            )
+            return
+        epic = existing.get("epic_name")
+        if not epic:
+            await interaction.followup.send(
+                f"{member.mention} has no Epic username stored. "
+                f"Use `/check @user epic_username` to link one."
+            )
+            return
+
+    # /check @user epic_username  (or refresh path above)
     try:
-        entry = await fetch_and_store(member.id, username)
+        entry = await fetch_and_store(member.id, epic)
     except PlayerNotFoundError as exc:
         await interaction.followup.send(f"Could not find that player: {exc}")
         return
@@ -235,7 +344,7 @@ async def check_command(
         await interaction.followup.send(f"Tracker Network error: {exc}")
         return
     except Exception:
-        log.exception("check failed for %s / %s", member.id, username)
+        log.exception("check failed for %s / %s", member.id, epic)
         await interaction.followup.send("Something went wrong while fetching MMR.")
         return
 
@@ -281,8 +390,7 @@ async def delete_command(
         )
     else:
         await interaction.response.send_message(
-            f"{member.mention} was not linked in storage.",
-            ephemeral=True,
+            f"{member.mention} was not linked in storage."
         )
 
 
