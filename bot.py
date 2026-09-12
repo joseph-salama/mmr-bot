@@ -53,8 +53,8 @@ FRIENDLY_NOT_FOUND = (
 )
 FRIENDLY_BLOCKED = (
     "Tracker Network is blocking this host (Cloudflare).\n"
-    "This usually happens on cloud hosts like Railway.\n"
-    "Run the bot on your PC, or set a real residential `TRACKER_PROXY`."
+    "On Railway you need a real residential `TRACKER_PROXY` "
+    "(FlareSolverr is not allowed on Railway)."
 )
 FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now."
 FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
