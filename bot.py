@@ -52,9 +52,9 @@ FRIENDLY_NOT_FOUND = (
     "double-check the exact spelling and capitalization, then try again."
 )
 FRIENDLY_BLOCKED = (
-    "Tracker Network is blocking Railway (Cloudflare).\n"
-    "Free fix: deploy FlareSolverr in the same Railway project and set "
-    "`FLARESOLVERR_URL` on the bot service."
+    "Tracker Network is blocking this host (Cloudflare).\n"
+    "This usually happens on cloud hosts like Railway.\n"
+    "Run the bot on your PC, or set a real residential `TRACKER_PROXY`."
 )
 FRIENDLY_TRACKER = "Couldn't reach Tracker Network right now."
 FRIENDLY_GENERIC = "Something went wrong while fetching MMR. Please try again."
@@ -245,14 +245,14 @@ class MMRBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user and self.user.id)
         log.info("Tracker fetch config: %s", config_status())
-        flare = os.getenv("FLARESOLVERR_URL", "").strip().strip('"').strip("'")
-        proxy = os.getenv("TRACKER_PROXY", "").strip()
-        if not flare and not proxy:
-            log.warning(
-                "No FLARESOLVERR_URL set. Railway will likely be Cloudflare-blocked. "
-                "Deploy free FlareSolverr (Docker: ghcr.io/flaresolverr/flaresolverr) "
-                "in this Railway project and set FLARESOLVERR_URL="
-                "http://<flaresolverr-service>.railway.internal:8191/v1"
+        if not (
+            os.getenv("TRACKER_PROXY", "").strip()
+            or os.getenv("FLARESOLVERR_URL", "").strip()
+            or os.getenv("SCRAPER_API_KEY", "").strip()
+        ):
+            log.info(
+                "No TRACKER_PROXY set. Direct Tracker lookups work on most home networks, "
+                "but often fail on cloud hosts due to Cloudflare."
             )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:

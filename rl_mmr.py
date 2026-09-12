@@ -388,8 +388,8 @@ def _raise_for_status(response: Any, epic_name: str, platform: str) -> None:
 
     if status == 403 or "you've been blocked" in body.lower() or "access denied" in body.lower():
         raise TrackerBlockedError(
-            "Tracker Network blocked the request (Cloudflare on Railway). "
-            "Deploy free FlareSolverr and set FLARESOLVERR_URL."
+            "Tracker Network blocked the request (Cloudflare). "
+            "Run the bot on a home PC, or set a real residential TRACKER_PROXY."
         )
 
     if status == 429:
@@ -474,8 +474,8 @@ def _request_json(url: str, *, epic_name: str, platform: str, retries: int = 3) 
                 idx = _IMPERSONATE_CANDIDATES.index(current)
             _impersonate = _IMPERSONATE_CANDIDATES[(idx + 1) % len(_IMPERSONATE_CANDIDATES)]
             last_error = TrackerBlockedError(
-                "Tracker Network blocked the request (Cloudflare on Railway). "
-                "Deploy free FlareSolverr and set FLARESOLVERR_URL."
+                "Tracker Network blocked the request (Cloudflare). "
+                "Run the bot on a home PC, or set a real residential TRACKER_PROXY."
             )
             time.sleep(1.2 * (attempt + 1))
             continue
