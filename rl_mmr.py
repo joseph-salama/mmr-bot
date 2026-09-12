@@ -265,8 +265,8 @@ def _flaresolverr_get(url: str) -> Any:
     """
     Fetch a URL through FlareSolverr (free, self-hosted Cloudflare bypass).
 
-    Expects FLARESOLVERR_URL like:
-      http://flaresolverr.railway.internal:8191/v1
+    Expects FLARESOLVERR_URL like (Railway reference variable recommended):
+      http://${{flaresolverr.RAILWAY_PRIVATE_DOMAIN}}:${{flaresolverr.PORT}}/v1
     """
     endpoint = _flaresolverr_endpoint()
     if not endpoint:
@@ -284,6 +284,19 @@ def _flaresolverr_get(url: str) -> Any:
     try:
         resp = crequests.post(endpoint, json=body, timeout=90)
     except Exception as exc:
+        err = str(exc)
+        if "Could not resolve host" in err or "curl: (6)" in err:
+            raise TrackerError(
+                "Cannot reach FlareSolverr (DNS failed). On the bot service set "
+                "FLARESOLVERR_URL=http://${{ExactServiceName.RAILWAY_PRIVATE_DOMAIN}}:"
+                "${{ExactServiceName.PORT}}/v1 using Railway's variable-reference picker, "
+                "and keep both services in the same project/environment."
+            ) from exc
+        if "Connection refused" in err or "curl: (7)" in err:
+            raise TrackerError(
+                "FlareSolverr connection refused. Check the service is running and "
+                "FLARESOLVERR_URL uses that service's PORT (Railway may not use 8191)."
+            ) from exc
         raise TrackerError(f"FlareSolverr request failed: {exc}") from exc
 
     try:
